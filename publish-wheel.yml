@@ -1,0 +1,73 @@
+name: Publish approved wheel
+
+# The repo owner approves a submitted wheel by commenting /approve on its issue.
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: publish-wheel
+
+jobs:
+  publish:
+    if: >-
+      github.event.issue.pull_request == null &&
+      startsWith(github.event.issue.title, '[Wheel]') &&
+      startsWith(github.event.comment.body, '/approve') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const crypto = require('crypto');
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+            const say = (body) => github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
+
+            const text = String(issue.body || '');
+            const a = text.indexOf('```json');
+            const b = text.lastIndexOf('```');
+            if (a < 0 || b <= a + 7) { await say('I could not find the wheel code block in this issue, so nothing was published.'); return; }
+
+            let raw;
+            try { raw = JSON.parse(text.slice(a + 7, b)); } catch (e) { await say('The wheel code block is not valid JSON, so nothing was published.'); return; }
+            if (!raw || !Array.isArray(raw.s)) { await say('The wheel code block has no segments, so nothing was published.'); return; }
+
+            const clean = (v, n) => String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, n);
+            const segs = raw.s.slice(0, 60).filter(Array.isArray).map((x) => [
+              clean(x[0], 60),
+              Number.isFinite(+x[1]) && +x[1] >= 0 ? Math.min(+x[1], 1e6) : 1,
+              /^[0-9a-f]{6}$/i.test(String(x[2])) ? String(x[2]).toLowerCase() : '9b9cab',
+            ]);
+            if (segs.length < 2 || !segs.some((s) => s[1] > 0)) { await say('A wheel needs at least two segments with a weight above zero, so nothing was published.'); return; }
+
+            const name = clean(raw.name, 60) || 'Wheel';
+            const id = crypto.createHash('sha1').update(JSON.stringify([name, segs])).digest('hex').slice(0, 10);
+            const entry = { id, name, user: issue.user.login, desc: clean(raw.desc, 140), r: raw.r ? 1 : 0, s: segs, date: new Date().toISOString().slice(0, 10) };
+
+            let sha;
+            let data = { wheels: [] };
+            try {
+              const res = await github.rest.repos.getContent({ owner, repo, path: 'gallery.json' });
+              sha = res.data.sha;
+              data = JSON.parse(Buffer.from(res.data.content, 'base64').toString('utf8'));
+              if (!data || !Array.isArray(data.wheels)) data = { wheels: [] };
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+            if (data.wheels.some((w) => w.id === id)) { await say('This exact wheel is already in the gallery.'); return; }
+            if (data.wheels.length >= 500) { await say('The gallery is full (500 wheels), so nothing was published.'); return; }
+
+            data.wheels.unshift(entry);
+            await github.rest.repos.createOrUpdateFileContents({
+              owner, repo, path: 'gallery.json', sha,
+              message: 'Publish "' + name + '" (issue #' + issue.number + ')',
+              content: Buffer.from(JSON.stringify(data, null, 1) + '\n').toString('base64'),
+            });
+            await say('Published. It shows up in the Explore tab in a minute or two.');
+            await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed' });
